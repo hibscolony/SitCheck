@@ -21,10 +21,15 @@ RTC_CONFIGURATION = RTCConfiguration(
             {"urls": ["stun:stun.l.google.com:19302"]},
             {"urls": ["stun:stun1.l.google.com:19302"]},
             {"urls": ["stun:stun2.l.google.com:19302"]},
+            # Open Relay Project — free public TURN server (no expiry)
             {
-                "urls": ["turn:free.expressturn.com:3478"],
-                "username": "000000002096550362",
-                "credential": "+wB87Fpja8nfNRg/mSed039T0ao=",
+                "urls": [
+                    "turn:openrelay.metered.ca:80",
+                    "turn:openrelay.metered.ca:443",
+                    "turn:openrelay.metered.ca:443?transport=tcp",
+                ],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
             },
         ],
         "iceTransportPolicy": "all",
@@ -305,6 +310,10 @@ webrtc_ctx = webrtc_streamer(
 alarm_box = st.empty()
 tips_box = st.empty()
 
+# Cooldown state: track last time alarm fired so it doesn't spam every rerun
+if "alarm_last_fired" not in st.session_state:
+    st.session_state.alarm_last_fired = 0.0
+
 if webrtc_ctx.video_processor:
     webrtc_ctx.video_processor.update_settings(
         conf_threshold,
@@ -318,11 +327,25 @@ if webrtc_ctx.video_processor:
         last_pred = webrtc_ctx.video_processor.last_pred
         last_is_bad = webrtc_ctx.video_processor.last_is_bad
 
-    if last_pred is not None and last_is_bad:
+    if last_pred is not None:
         label, conf = last_pred
-        alarm_box.error(f"ALARM: postur buruk terdeteksi ({label}, {conf:.2f})")
-        tips = tips_for_label(label)
-        tips_box.info("Saran:\n" + "\n".join(f"- {tip}" for tip in tips))
+        if last_is_bad:
+            now = time.time()
+            alarm_box.error(f"⚠️ ALARM: postur buruk terdeteksi ({label}, {conf:.2f})")
+            tips = tips_for_label(label)
+            tips_box.info("Saran:\n" + "\n".join(f"- {tip}" for tip in tips))
+            # Play audio only when cooldown has elapsed
+            if now - st.session_state.alarm_last_fired >= ALARM_COOLDOWN_SEC:
+                st.session_state.alarm_last_fired = now
+                play_alarm_audio()
+        else:
+            alarm_box.success(f"✅ Postur baik ({label}, {conf:.2f})")
+            tips_box.empty()
+
+# Keep polling while the stream is active (this is the missing rerun loop)
+if webrtc_ctx.state.playing:
+    time.sleep(ALARM_POLL_INTERVAL_SEC)
+    st.rerun()
 
 st.divider()
 st.caption("Single image fallback")
