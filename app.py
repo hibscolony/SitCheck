@@ -1,46 +1,27 @@
+"""
+app.py — Posture Classifier (No WebRTC)
+Real-time via st_autorefresh + st.camera_input
+Compatible: Streamlit Cloud, local, any network
+"""
 from __future__ import annotations
 
 import base64
 import io
-from pathlib import Path
-import threading
-import time
 import wave
+from pathlib import Path
 from typing import Iterable
 
-import av
 import cv2
 import numpy as np
 import streamlit as st
-from streamlit_webrtc import WebRtcMode, webrtc_streamer, VideoProcessorBase, RTCConfiguration
+from streamlit_autorefresh import st_autorefresh
 from ultralytics import YOLO
 
-RTC_CONFIGURATION = RTCConfiguration(
-    {
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]},
-            {"urls": ["stun:stun1.l.google.com:19302"]},
-            {"urls": ["stun:stun2.l.google.com:19302"]},
-            # Open Relay Project — free public TURN server (no expiry)
-            {
-                "urls": [
-                    "turn:openrelay.metered.ca:80",
-                    "turn:openrelay.metered.ca:443",
-                    "turn:openrelay.metered.ca:443?transport=tcp",
-                ],
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-        ],
-        "iceTransportPolicy": "all",
-    }
-)
+# ─────────────────────────── Constants ───────────────────────────
 
 WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 DEFAULT_IMG_SIZE = 224
 DEFAULT_ALARM_THRESHOLD = 0.7
-ALARM_COOLDOWN_SEC = 2.0
-ALARM_POLL_INTERVAL_SEC = 0.2
 DEFAULT_BAD_LABEL_HINTS = ("bad", "slouch", "hunch", "forward", "lean", "tilt")
 DEFAULT_GOOD_LABEL_HINTS = ("good", "normal", "upright", "correct", "ok", "proper")
 DEFAULT_TIPS = (
@@ -72,6 +53,8 @@ TIP_RULES = {
     ),
 }
 
+# ─────────────────────────── Helpers ───────────────────────────
+
 
 @st.cache_resource
 def load_model(model_path: str) -> YOLO:
@@ -86,7 +69,7 @@ def resolve_label(names: object, index: int) -> str:
     return str(index)
 
 
-def topk_scores(scores: np.ndarray, k: int) -> Iterable[tuple[int, float]]:
+def topk_scores(scores: np.ndarray, k: int) -> list[tuple[int, float]]:
     if scores.size == 0:
         return []
     k = max(1, min(k, scores.size))
@@ -103,156 +86,102 @@ def list_labels(names: object) -> list[str]:
 
 
 def infer_bad_labels(labels: list[str]) -> list[str]:
-    bad_labels = [label for label in labels if any(hint in label.lower() for hint in DEFAULT_BAD_LABEL_HINTS)]
-    if bad_labels:
-        return bad_labels
-    return [
-        label
-        for label in labels
-        if not any(hint in label.lower() for hint in DEFAULT_GOOD_LABEL_HINTS)
-    ]
+    bad = [l for l in labels if any(h in l.lower() for h in DEFAULT_BAD_LABEL_HINTS)]
+    if bad:
+        return bad
+    return [l for l in labels if not any(h in l.lower() for h in DEFAULT_GOOD_LABEL_HINTS)]
 
 
 def tips_for_label(label: str) -> list[str]:
-    lower_label = label.lower()
     for key, tips in TIP_RULES.items():
-        if key in lower_label:
+        if key in label.lower():
             return list(tips)
     return list(DEFAULT_TIPS)
 
 
 @st.cache_data
 def alarm_audio_data_uri() -> str:
-    duration = 0.25
-    sample_rate = 22050
-    frequency = 880.0
+    duration, sample_rate, frequency = 0.25, 22050, 880.0
     t = np.linspace(0, duration, int(sample_rate * duration), False)
     tone = 0.5 * np.sin(2 * np.pi * frequency * t)
     audio = (tone * np.iinfo(np.int16).max).astype(np.int16)
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wave_file:
-        wave_file.setnchannels(1)
-        wave_file.setsampwidth(2)
-        wave_file.setframerate(sample_rate)
-        wave_file.writeframes(audio.tobytes())
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio.tobytes())
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:audio/wav;base64,{encoded}"
 
 
 def play_alarm_audio() -> None:
-    audio_uri = alarm_audio_data_uri()
+    uri = alarm_audio_data_uri()
     st.components.v1.html(
-        f'<audio autoplay="true"><source src="{audio_uri}" type="audio/wav"></audio>',
+        f'<audio autoplay="true"><source src="{uri}" type="audio/wav"></audio>',
         height=0,
     )
 
 
-class PostureVideoProcessor(VideoProcessorBase):
-    def __init__(
-        self,
-        model: YOLO,
-        names: object,
-        conf_threshold: float,
-        top_k: int,
-        img_size: int,
-        bad_labels: Iterable[str],
-        alarm_threshold: float,
-    ) -> None:
-        self.model = model
-        self.names = names
-        self.conf_threshold = conf_threshold
-        self.top_k = top_k
-        self.img_size = img_size
-        self.bad_labels = {str(label) for label in bad_labels}
-        self.alarm_threshold = alarm_threshold
-        self.lock = threading.Lock()
-        self.last_pred: tuple[str, float] | None = None
-        self.last_is_bad = False
+def run_inference(image: np.ndarray, model: YOLO, img_size: int) -> np.ndarray | None:
+    """Run YOLO classify predict, return flat score array or None."""
+    results = model.predict(image, imgsz=img_size, verbose=False)
+    if not results:
+        return None
+    probs = getattr(results[0], "probs", None)
+    if probs is None or getattr(probs, "data", None) is None:
+        return None
+    scores = probs.data
+    if hasattr(scores, "cpu"):
+        scores = scores.cpu().numpy()
+    return np.asarray(scores).reshape(-1)
 
-    def update_settings(
-        self,
-        conf_threshold: float,
-        top_k: int,
-        img_size: int,
-        alarm_threshold: float,
-        bad_labels: Iterable[str],
-    ) -> None:
-        self.conf_threshold = conf_threshold
-        self.top_k = top_k
-        self.img_size = img_size
-        self.alarm_threshold = alarm_threshold
-        self.bad_labels = {str(label) for label in bad_labels}
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        image = frame.to_ndarray(format="bgr24")
-        height, width = image.shape[:2]
-        results = self.model.predict(image, imgsz=self.img_size, verbose=False)
-        if results:
-            probs = getattr(results[0], "probs", None)
-            if probs is not None and getattr(probs, "data", None) is not None:
-                scores = probs.data
-                if hasattr(scores, "cpu"):
-                    scores = scores.cpu().numpy()
-                else:
-                    scores = np.asarray(scores)
-                scores = np.asarray(scores).reshape(-1)
+def annotate_image(
+    image: np.ndarray,
+    scores: np.ndarray,
+    model_names: object,
+    bad_labels: set[str],
+    alarm_threshold: float,
+    conf_threshold: float,
+    top_k: int,
+) -> tuple[np.ndarray, str, float, bool]:
+    """Draw overlays on image. Returns annotated image, top label, top conf, is_bad."""
+    h, w = image.shape[:2]
+    top1_idx = int(scores.argmax())
+    top1_label = resolve_label(model_names, top1_idx)
+    top1_conf = float(scores[top1_idx])
+    is_bad = top1_label in bad_labels and top1_conf >= alarm_threshold
 
-                if scores.size:
-                    top1_index = int(scores.argmax())
-                    top1_label = resolve_label(self.names, top1_index)
-                    top1_conf = float(scores[top1_index])
-                    is_bad = top1_label in self.bad_labels and top1_conf >= self.alarm_threshold
-                    with self.lock:
-                        self.last_pred = (top1_label, top1_conf)
-                        self.last_is_bad = is_bad
+    out = image.copy()
+    if is_bad:
+        cv2.rectangle(out, (0, 0), (w - 1, h - 1), (0, 0, 255), 6)
+        cv2.putText(out, "WARNING: BAD POSTURE", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3, cv2.LINE_AA)
 
-                    if is_bad:
-                        cv2.rectangle(image, (0, 0), (width - 1, height - 1), (0, 0, 255), 6)
-                        cv2.putText(
-                            image,
-                            "WARNING: BAD POSTURE",
-                            (10, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.9,
-                            (0, 0, 255),
-                            3,
-                            cv2.LINE_AA,
-                        )
-                else:
-                    with self.lock:
-                        self.last_pred = None
-                        self.last_is_bad = False
+    line_h = 28
+    n = min(top_k, scores.size)
+    y = max(line_h, h - 10 - line_h * (n - 1))
+    for idx, conf in topk_scores(scores, top_k):
+        label = resolve_label(model_names, idx)
+        color = (0, 255, 0) if conf >= conf_threshold else (0, 165, 255)
+        cv2.putText(out, f"{label}: {conf:.2f}", (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+        y += 28
 
-                line_height = 28
-                num_lines = min(self.top_k, int(scores.size)) if scores.size else 1
-                y = max(line_height, height - 10 - line_height * (num_lines - 1))
-                for index, conf in topk_scores(scores, self.top_k):
-                    label = resolve_label(self.names, index)
-                    color = (0, 255, 0) if conf >= self.conf_threshold else (0, 165, 255)
-                    text = f"{label}: {conf:.2f}"
-                    cv2.putText(
-                        image,
-                        text,
-                        (10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        color,
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    y += 28
+    return out, top1_label, top1_conf, is_bad
 
-        return av.VideoFrame.from_ndarray(image, format="bgr24")
 
+# ─────────────────────────── UI ───────────────────────────
 
 st.set_page_config(page_title="Posture Classifier", layout="wide")
+st.title("🧍 Posture Classifier")
+st.write("Kamera otomatis refresh tiap beberapa detik. Tidak butuh WebRTC.")
 
-st.title("Posture classifier")
-st.write("Allow camera access when prompted to run live predictions.")
-
+# ── Sidebar ──
 weights = sorted([p.name for p in WEIGHTS_DIR.glob("*.pt")])
 if not weights:
-    st.error(f"No .pt model weights found in {WEIGHTS_DIR}")
+    st.error(f"No .pt weights found in {WEIGHTS_DIR}")
     st.stop()
 
 selected_weight = st.sidebar.selectbox(
@@ -261,136 +190,124 @@ selected_weight = st.sidebar.selectbox(
     index=weights.index("best.pt") if "best.pt" in weights else 0,
 )
 img_size = st.sidebar.select_slider(
-    "Image size",
-    options=[160, 192, 224, 256, 288, 320],
-    value=DEFAULT_IMG_SIZE,
+    "Image size", options=[160, 192, 224, 256, 288, 320], value=DEFAULT_IMG_SIZE
 )
 conf_threshold = st.sidebar.slider("Display threshold", 0.0, 1.0, 0.5, 0.01)
 top_k = st.sidebar.slider("Top-K", 1, 5, 2)
-alarm_threshold = st.sidebar.slider(
-    "Alarm threshold",
-    0.0,
-    1.0,
-    DEFAULT_ALARM_THRESHOLD,
-    0.01,
+alarm_threshold = st.sidebar.slider("Alarm threshold", 0.0, 1.0, DEFAULT_ALARM_THRESHOLD, 0.01)
+refresh_interval = st.sidebar.select_slider(
+    "Auto-refresh interval (ms)",
+    options=[500, 1000, 1500, 2000, 3000],
+    value=1500,
 )
 
-model_path = WEIGHTS_DIR / selected_weight
-model = load_model(str(model_path))
+model = load_model(str(WEIGHTS_DIR / selected_weight))
 label_options = list_labels(model.names)
-bad_labels = infer_bad_labels(label_options)
+bad_labels: set[str] = set(infer_bad_labels(label_options))
+
 if bad_labels:
-    st.sidebar.caption("Bad posture labels: " + ", ".join(bad_labels))
+    st.sidebar.caption("Bad posture labels: " + ", ".join(sorted(bad_labels)))
 else:
-    st.sidebar.caption("Bad posture labels: none detected from names.")
+    st.sidebar.caption("Bad posture labels: none auto-detected.")
 
-st.caption("Live camera")
-st.info(
-    "Kalau live camera lama connect di Streamlit Cloud, gunakan fitur snapshot/upload di bawah. "
-    "WebRTC kadang butuh jaringan yang mengizinkan STUN/TURN."
-)
+# ── Mode tabs ──
+tab_live, tab_upload = st.tabs(["📷 Live (auto-refresh)", "🖼️ Upload / Snapshot"])
 
-webrtc_ctx = webrtc_streamer(
-    key="posture-classifier",
-    mode=WebRtcMode.SENDRECV,
-    media_stream_constraints={"video": True, "audio": False},
-    rtc_configuration=RTC_CONFIGURATION,
-    video_processor_factory=lambda: PostureVideoProcessor(
-        model,
-        model.names,
-        conf_threshold,
-        top_k,
-        img_size,
-        bad_labels,
-        alarm_threshold,
-    ),
-    async_processing=True,
-)
-
-alarm_box = st.empty()
-tips_box = st.empty()
-
-# Cooldown state: track last time alarm fired so it doesn't spam every rerun
-if "alarm_last_fired" not in st.session_state:
-    st.session_state.alarm_last_fired = 0.0
-
-if webrtc_ctx.video_processor:
-    webrtc_ctx.video_processor.update_settings(
-        conf_threshold,
-        top_k,
-        img_size,
-        alarm_threshold,
-        bad_labels,
+# ══════════════ TAB 1: Live mode ══════════════
+with tab_live:
+    st.info(
+        "Klik **Take photo** lalu biarkan auto-refresh berjalan. "
+        "Setiap interval, frame terakhir akan diklasifikasi ulang secara otomatis."
     )
 
-    with webrtc_ctx.video_processor.lock:
-        last_pred = webrtc_ctx.video_processor.last_pred
-        last_is_bad = webrtc_ctx.video_processor.last_is_bad
+    # Auto-refresh — only ticks when this tab is active (component is rendered)
+    count = st_autorefresh(interval=refresh_interval, limit=None, key="live_refresh")
 
-    if last_pred is not None:
-        label, conf = last_pred
-        if last_is_bad:
-            now = time.time()
-            alarm_box.error(f"⚠️ ALARM: postur buruk terdeteksi ({label}, {conf:.2f})")
-            tips = tips_for_label(label)
-            tips_box.info("Saran:\n" + "\n".join(f"- {tip}" for tip in tips))
-            # Play audio only when cooldown has elapsed
-            if now - st.session_state.alarm_last_fired >= ALARM_COOLDOWN_SEC:
-                st.session_state.alarm_last_fired = now
-                play_alarm_audio()
-        else:
-            alarm_box.success(f"✅ Postur baik ({label}, {conf:.2f})")
-            tips_box.empty()
+    photo = st.camera_input("Kamera", key=f"cam_{count}", label_visibility="collapsed")
 
-# Keep polling while the stream is active (this is the missing rerun loop)
-if webrtc_ctx.state.playing:
-    time.sleep(ALARM_POLL_INTERVAL_SEC)
-    st.rerun()
+    result_col, tips_col = st.columns([2, 1])
 
-st.divider()
-st.caption("Single image fallback")
+    with result_col:
+        if photo is not None:
+            file_bytes = np.asarray(bytearray(photo.read()), dtype=np.uint8)
+            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-st.write("Gunakan salah satu: ambil foto dari kamera browser atau upload gambar.")
-camera_photo = st.camera_input("Take a photo")
-uploaded = st.file_uploader("Upload a photo", type=["jpg", "jpeg", "png"])
-
-image_source = camera_photo if camera_photo is not None else uploaded
-
-if image_source is not None:
-    file_bytes = np.asarray(bytearray(image_source.read()), dtype=np.uint8)
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    if image is None:
-        st.error("Could not read the image file.")
-    else:
-        results = model.predict(image, imgsz=img_size, verbose=False)
-        probs = getattr(results[0], "probs", None)
-        if probs is None or getattr(probs, "data", None) is None:
-            st.error("No classification scores returned.")
-        else:
-            scores = probs.data
-            if hasattr(scores, "cpu"):
-                scores = scores.cpu().numpy()
+            if img is None:
+                st.error("Gagal membaca frame kamera.")
             else:
-                scores = np.asarray(scores)
-            scores = np.asarray(scores).reshape(-1)
+                scores = run_inference(img, model, img_size)
+                if scores is not None and scores.size:
+                    annotated, top_label, top_conf, is_bad = annotate_image(
+                        img, scores, model.names, bad_labels,
+                        alarm_threshold, conf_threshold, top_k,
+                    )
+                    st.image(annotated, channels="BGR", use_container_width=True)
 
-            if scores.size:
-                top1_index = int(scores.argmax())
-                top1_label = resolve_label(model.names, top1_index)
-                top1_conf = float(scores[top1_index])
-                is_bad = top1_label in bad_labels and top1_conf >= alarm_threshold
-
-                if is_bad:
-                    st.error(f"ALARM: postur buruk terdeteksi ({top1_label}, {top1_conf:.2f})")
-                    tips = tips_for_label(top1_label)
-                    st.info("Saran:\n" + "\n".join(f"- {tip}" for tip in tips))
-                    play_alarm_audio()
+                    if is_bad:
+                        st.error(f"⚠️ ALARM: postur buruk — **{top_label}** ({top_conf:.2f})")
+                        play_alarm_audio()
+                    else:
+                        st.success(f"✅ Postur aman — **{top_label}** ({top_conf:.2f})")
                 else:
-                    st.success(f"Postur terdeteksi aman/baik ({top1_label}, {top1_conf:.2f})")
+                    st.warning("Model tidak mengembalikan skor. Coba ulang.")
+        else:
+            st.caption("Belum ada foto. Klik tombol kamera di atas.")
 
-            lines = []
-            for index, conf in topk_scores(scores, top_k):
-                label = resolve_label(model.names, index)
-                lines.append(f"{label}: {conf:.3f}")
-            st.write("\n".join(lines))
-            st.image(image, channels="BGR", caption="Input")
+    with tips_col:
+        # Show tips based on last known bad label stored in session state
+        if photo is not None:
+            file_bytes2 = np.asarray(bytearray(photo.getvalue()), dtype=np.uint8)
+            img2 = cv2.imdecode(file_bytes2, cv2.IMREAD_COLOR)
+            if img2 is not None:
+                scores2 = run_inference(img2, model, img_size)
+                if scores2 is not None and scores2.size:
+                    top1_idx = int(scores2.argmax())
+                    top1_label = resolve_label(model.names, top1_idx)
+                    top1_conf = float(scores2[top1_idx])
+                    is_bad2 = top1_label in bad_labels and top1_conf >= alarm_threshold
+                    if is_bad2:
+                        st.subheader("💡 Saran")
+                        for tip in tips_for_label(top1_label):
+                            st.markdown(f"- {tip}")
+
+# ══════════════ TAB 2: Upload / Snapshot ══════════════
+with tab_upload:
+    camera_photo = st.camera_input("Ambil foto")
+    uploaded = st.file_uploader("Atau upload gambar", type=["jpg", "jpeg", "png"])
+
+    source = camera_photo if camera_photo is not None else uploaded
+
+    if source is not None:
+        file_bytes = np.asarray(bytearray(source.read()), dtype=np.uint8)
+        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+        if image is None:
+            st.error("Tidak bisa membaca file gambar.")
+        else:
+            scores = run_inference(image, model, img_size)
+            if scores is None or not scores.size:
+                st.error("Model tidak mengembalikan skor.")
+            else:
+                annotated, top_label, top_conf, is_bad = annotate_image(
+                    image, scores, model.names, bad_labels,
+                    alarm_threshold, conf_threshold, top_k,
+                )
+
+                col_img, col_info = st.columns([2, 1])
+                with col_img:
+                    st.image(annotated, channels="BGR", use_container_width=True, caption="Hasil")
+
+                with col_info:
+                    if is_bad:
+                        st.error(f"⚠️ ALARM: postur buruk\n**{top_label}** ({top_conf:.2f})")
+                        play_alarm_audio()
+                        st.subheader("💡 Saran")
+                        for tip in tips_for_label(top_label):
+                            st.markdown(f"- {tip}")
+                    else:
+                        st.success(f"✅ Postur aman\n**{top_label}** ({top_conf:.2f})")
+
+                    st.subheader("Top-K Scores")
+                    for idx, conf in topk_scores(scores, top_k):
+                        label = resolve_label(model.names, idx)
+                        st.metric(label, f"{conf:.3f}")
