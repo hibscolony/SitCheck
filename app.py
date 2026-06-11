@@ -12,9 +12,16 @@ import av
 import cv2
 import numpy as np
 import streamlit as st
-from streamlit_webrtc import WebRtcMode, webrtc_streamer, VideoProcessorBase
+from streamlit_webrtc import WebRtcMode, webrtc_streamer, VideoProcessorBase, RTCConfiguration
 from ultralytics import YOLO
 
+RTC_CONFIGURATION = RTCConfiguration(
+    {
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]}
+        ]
+    }
+)
 
 WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 DEFAULT_IMG_SIZE = 224
@@ -270,7 +277,7 @@ webrtc_ctx = webrtc_streamer(
     key="posture-classifier",
     mode=WebRtcMode.SENDRECV,
     media_stream_constraints={"video": True, "audio": False},
-    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    rtc_configuration=RTC_CONFIGURATION,
     video_processor_factory=lambda: PostureVideoProcessor(
         model,
         model.names,
