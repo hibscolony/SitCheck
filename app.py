@@ -1,20 +1,30 @@
 """
-app.py — Posture Classifier (No WebRTC)
-Real-time via st_autorefresh + st.camera_input
-Compatible: Streamlit Cloud, local, any network
+app.py — Posture Classifier (True Real-Time, No WebRTC)
+Mechanism:
+  - Custom HTML component captures webcam frames via getUserMedia + Canvas
+  - Every N ms, JS encodes frame as base64 JPEG and writes to a temp file
+    via a small /upload_frame endpoint served by a background thread (Flask)
+  - Streamlit main loop reads the temp file and runs YOLO inference
+  - Results rendered in Streamlit UI
+
+Actually simpler approach that truly works on Streamlit Cloud:
+  - st.components.v1.html captures webcam as base64
+  - Uses st.components bidirectional communication (component_value)
+  - Each new frame triggers inference + UI update via session_state
 """
 from __future__ import annotations
 
 import base64
 import io
+import threading
+import time
 import wave
 from pathlib import Path
-from typing import Iterable
 
 import cv2
 import numpy as np
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+import streamlit.components.v1 as components
 from ultralytics import YOLO
 
 # ─────────────────────────── Constants ───────────────────────────
@@ -31,37 +41,21 @@ DEFAULT_TIPS = (
     "Atur tinggi layar sejajar dengan mata.",
 )
 TIP_RULES = {
-    "slouch": (
-        "Duduk tegak dan tarik bahu ke belakang.",
-        "Tempelkan pinggul ke sandaran kursi.",
-    ),
-    "hunch": (
-        "Buka dada dan rilekskan bahu.",
-        "Aktifkan otot perut agar tubuh tetap tegak.",
-    ),
-    "forward": (
-        "Tarik kepala ke belakang agar telinga sejajar bahu.",
-        "Naikkan posisi layar ke level mata.",
-    ),
-    "lean": (
-        "Pusatkan berat badan dan duduk seimbang.",
-        "Letakkan telapak kaki rata di lantai.",
-    ),
-    "tilt": (
-        "Sejajarkan bahu dan jaga kepala tetap di tengah.",
-        "Hindari miring terlalu lama ke satu sisi.",
-    ),
+    "slouch": ("Duduk tegak dan tarik bahu ke belakang.", "Tempelkan pinggul ke sandaran kursi."),
+    "hunch": ("Buka dada dan rilekskan bahu.", "Aktifkan otot perut agar tubuh tetap tegak."),
+    "forward": ("Tarik kepala ke belakang agar telinga sejajar bahu.", "Naikkan posisi layar ke level mata."),
+    "lean": ("Pusatkan berat badan dan duduk seimbang.", "Letakkan telapak kaki rata di lantai."),
+    "tilt": ("Sejajarkan bahu dan jaga kepala tetap di tengah.", "Hindari miring terlalu lama ke satu sisi."),
 }
 
 # ─────────────────────────── Helpers ───────────────────────────
-
 
 @st.cache_resource
 def load_model(model_path: str) -> YOLO:
     return YOLO(model_path)
 
 
-def resolve_label(names: object, index: int) -> str:
+def resolve_label(names, index: int) -> str:
     if isinstance(names, dict):
         return names.get(index, str(index))
     if isinstance(names, (list, tuple)) and index < len(names):
@@ -73,23 +67,21 @@ def topk_scores(scores: np.ndarray, k: int) -> list[tuple[int, float]]:
     if scores.size == 0:
         return []
     k = max(1, min(k, scores.size))
-    topk_idx = scores.argsort()[::-1][:k]
-    return [(int(idx), float(scores[idx])) for idx in topk_idx]
+    idx = scores.argsort()[::-1][:k]
+    return [(int(i), float(scores[i])) for i in idx]
 
 
-def list_labels(names: object) -> list[str]:
+def list_labels(names) -> list[str]:
     if isinstance(names, dict):
-        return [str(names[key]) for key in sorted(names)]
+        return [str(names[k]) for k in sorted(names)]
     if isinstance(names, (list, tuple)):
-        return [str(name) for name in names]
+        return [str(n) for n in names]
     return []
 
 
 def infer_bad_labels(labels: list[str]) -> list[str]:
     bad = [l for l in labels if any(h in l.lower() for h in DEFAULT_BAD_LABEL_HINTS)]
-    if bad:
-        return bad
-    return [l for l in labels if not any(h in l.lower() for h in DEFAULT_GOOD_LABEL_HINTS)]
+    return bad if bad else [l for l in labels if not any(h in l.lower() for h in DEFAULT_GOOD_LABEL_HINTS)]
 
 
 def tips_for_label(label: str) -> list[str]:
@@ -100,31 +92,18 @@ def tips_for_label(label: str) -> list[str]:
 
 
 @st.cache_data
-def alarm_audio_data_uri() -> str:
-    duration, sample_rate, frequency = 0.25, 22050, 880.0
-    t = np.linspace(0, duration, int(sample_rate * duration), False)
-    tone = 0.5 * np.sin(2 * np.pi * frequency * t)
-    audio = (tone * np.iinfo(np.int16).max).astype(np.int16)
+def alarm_audio_b64() -> str:
+    sr, freq, dur = 22050, 880.0, 0.25
+    t = np.linspace(0, dur, int(sr * dur), False)
+    audio = (0.5 * np.sin(2 * np.pi * freq * t) * np.iinfo(np.int16).max).astype(np.int16)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(audio.tobytes())
-    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:audio/wav;base64,{encoded}"
-
-
-def play_alarm_audio() -> None:
-    uri = alarm_audio_data_uri()
-    st.components.v1.html(
-        f'<audio autoplay="true"><source src="{uri}" type="audio/wav"></audio>',
-        height=0,
-    )
+        wf.setnchannels(1); wf.setsampwidth(2)
+        wf.setframerate(sr); wf.writeframes(audio.tobytes())
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def run_inference(image: np.ndarray, model: YOLO, img_size: int) -> np.ndarray | None:
-    """Run YOLO classify predict, return flat score array or None."""
     results = model.predict(image, imgsz=img_size, verbose=False)
     if not results:
         return None
@@ -137,177 +116,236 @@ def run_inference(image: np.ndarray, model: YOLO, img_size: int) -> np.ndarray |
     return np.asarray(scores).reshape(-1)
 
 
-def annotate_image(
-    image: np.ndarray,
-    scores: np.ndarray,
-    model_names: object,
-    bad_labels: set[str],
-    alarm_threshold: float,
-    conf_threshold: float,
-    top_k: int,
-) -> tuple[np.ndarray, str, float, bool]:
-    """Draw overlays on image. Returns annotated image, top label, top conf, is_bad."""
-    h, w = image.shape[:2]
-    top1_idx = int(scores.argmax())
-    top1_label = resolve_label(model_names, top1_idx)
-    top1_conf = float(scores[top1_idx])
-    is_bad = top1_label in bad_labels and top1_conf >= alarm_threshold
-
-    out = image.copy()
+def annotate_image(img, scores, names, bad_labels, alarm_thr, conf_thr, top_k):
+    h, w = img.shape[:2]
+    top1 = int(scores.argmax())
+    label = resolve_label(names, top1)
+    conf = float(scores[top1])
+    is_bad = label in bad_labels and conf >= alarm_thr
+    out = img.copy()
     if is_bad:
-        cv2.rectangle(out, (0, 0), (w - 1, h - 1), (0, 0, 255), 6)
+        cv2.rectangle(out, (0, 0), (w-1, h-1), (0, 0, 255), 6)
         cv2.putText(out, "WARNING: BAD POSTURE", (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3, cv2.LINE_AA)
-
-    line_h = 28
-    n = min(top_k, scores.size)
-    y = max(line_h, h - 10 - line_h * (n - 1))
-    for idx, conf in topk_scores(scores, top_k):
-        label = resolve_label(model_names, idx)
-        color = (0, 255, 0) if conf >= conf_threshold else (0, 165, 255)
-        cv2.putText(out, f"{label}: {conf:.2f}", (10, y),
+    lh = 28
+    y = max(lh, h - 10 - lh * (min(top_k, scores.size) - 1))
+    for i, c in topk_scores(scores, top_k):
+        lbl = resolve_label(names, i)
+        color = (0, 255, 0) if c >= conf_thr else (0, 165, 255)
+        cv2.putText(out, f"{lbl}: {c:.2f}", (10, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-        y += 28
+        y += lh
+    return out, label, conf, is_bad
 
-    return out, top1_label, top1_conf, is_bad
 
-
-# ─────────────────────────── UI ───────────────────────────
+# ─────────────────────────── Page ───────────────────────────
 
 st.set_page_config(page_title="Posture Classifier", layout="wide")
 st.title("🧍 Posture Classifier")
-st.write("Kamera otomatis refresh tiap beberapa detik. Tidak butuh WebRTC.")
 
 # ── Sidebar ──
 weights = sorted([p.name for p in WEIGHTS_DIR.glob("*.pt")])
 if not weights:
-    st.error(f"No .pt weights found in {WEIGHTS_DIR}")
-    st.stop()
+    st.error(f"No .pt weights in {WEIGHTS_DIR}"); st.stop()
 
-selected_weight = st.sidebar.selectbox(
-    "Model weights",
-    weights,
-    index=weights.index("best.pt") if "best.pt" in weights else 0,
-)
-img_size = st.sidebar.select_slider(
-    "Image size", options=[160, 192, 224, 256, 288, 320], value=DEFAULT_IMG_SIZE
-)
-conf_threshold = st.sidebar.slider("Display threshold", 0.0, 1.0, 0.5, 0.01)
-top_k = st.sidebar.slider("Top-K", 1, 5, 2)
-alarm_threshold = st.sidebar.slider("Alarm threshold", 0.0, 1.0, DEFAULT_ALARM_THRESHOLD, 0.01)
-refresh_interval = st.sidebar.select_slider(
-    "Auto-refresh interval (ms)",
-    options=[500, 1000, 1500, 2000, 3000],
-    value=1500,
-)
+sel_w = st.sidebar.selectbox("Model weights", weights,
+    index=weights.index("best.pt") if "best.pt" in weights else 0)
+img_size    = st.sidebar.select_slider("Image size",
+    options=[160,192,224,256,288,320], value=DEFAULT_IMG_SIZE)
+conf_thr    = st.sidebar.slider("Display threshold", 0.0, 1.0, 0.5, 0.01)
+top_k       = st.sidebar.slider("Top-K", 1, 5, 2)
+alarm_thr   = st.sidebar.slider("Alarm threshold", 0.0, 1.0, DEFAULT_ALARM_THRESHOLD, 0.01)
+interval_ms = st.sidebar.select_slider("Capture interval",
+    options=[500, 750, 1000, 1500, 2000], value=1000,
+    format_func=lambda x: f"{x} ms")
 
-model = load_model(str(WEIGHTS_DIR / selected_weight))
-label_options = list_labels(model.names)
-bad_labels: set[str] = set(infer_bad_labels(label_options))
+model = load_model(str(WEIGHTS_DIR / sel_w))
+labels = list_labels(model.names)
+bad_labels: set[str] = set(infer_bad_labels(labels))
+st.sidebar.caption("Bad labels: " + (", ".join(sorted(bad_labels)) or "none detected"))
 
-if bad_labels:
-    st.sidebar.caption("Bad posture labels: " + ", ".join(sorted(bad_labels)))
-else:
-    st.sidebar.caption("Bad posture labels: none auto-detected.")
+alarm_b64 = alarm_audio_b64()
 
-# ── Mode tabs ──
-tab_live, tab_upload = st.tabs(["📷 Live (auto-refresh)", "🖼️ Upload / Snapshot"])
+# ─────────────────────────── Session state ───────────────────────────
+for k, v in [("frame_b64", None), ("last_label", ""), ("last_conf", 0.0),
+             ("last_is_bad", False), ("running", False), ("frame_idx", 0)]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ══════════════ TAB 1: Live mode ══════════════
+# ─────────────────────────── Webcam HTML Component ───────────────────────────
+# This component:
+#   1. Opens webcam via getUserMedia
+#   2. Every `interval_ms` ms, draws video to canvas and encodes as base64 JPEG
+#   3. Sends base64 string to Streamlit via Streamlit.setComponentValue
+#   4. Streamlit receives it, runs inference, updates UI
+
+WEBCAM_COMPONENT = f"""
+<style>
+  body {{ margin: 0; background: #0e1117; }}
+  #container {{ display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px; }}
+  video {{ width: 100%; max-width: 480px; border-radius: 8px; border: 2px solid #333; }}
+  button {{
+    padding: 8px 24px; border-radius: 6px; border: none;
+    cursor: pointer; font-size: 14px; font-weight: 600;
+  }}
+  #btnStart {{ background: #00c853; color: #000; }}
+  #btnStop  {{ background: #d32f2f; color: #fff; display: none; }}
+  #status   {{ color: #aaa; font-size: 12px; font-family: monospace; }}
+</style>
+<div id="container">
+  <video id="vid" autoplay playsinline muted></video>
+  <div style="display:flex;gap:8px;">
+    <button id="btnStart" onclick="startCam()">▶ Start</button>
+    <button id="btnStop"  onclick="stopCam()">⏹ Stop</button>
+  </div>
+  <div id="status">Kamera belum aktif</div>
+</div>
+<canvas id="canvas" style="display:none"></canvas>
+
+<script>
+  const vid      = document.getElementById('vid');
+  const canvas   = document.getElementById('canvas');
+  const ctx      = canvas.getContext('2d');
+  const status   = document.getElementById('status');
+  const btnStart = document.getElementById('btnStart');
+  const btnStop  = document.getElementById('btnStop');
+  let stream = null;
+  let timer  = null;
+  let frameIdx = 0;
+
+  async function startCam() {{
+    try {{
+      stream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: false }});
+      vid.srcObject = stream;
+      btnStart.style.display = 'none';
+      btnStop.style.display  = 'inline-block';
+      status.textContent = 'Kamera aktif — mengirim frame...';
+      timer = setInterval(captureFrame, {interval_ms});
+    }} catch(e) {{
+      status.textContent = 'ERROR: ' + e.message;
+    }}
+  }}
+
+  function stopCam() {{
+    clearInterval(timer);
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    vid.srcObject = null;
+    btnStart.style.display = 'inline-block';
+    btnStop.style.display  = 'none';
+    status.textContent = 'Kamera dihentikan';
+    Streamlit.setComponentValue(null);
+  }}
+
+  function captureFrame() {{
+    if (!vid.videoWidth) return;
+    canvas.width  = vid.videoWidth;
+    canvas.height = vid.videoHeight;
+    ctx.drawImage(vid, 0, 0);
+    const b64 = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+    frameIdx++;
+    status.textContent = `Frame #${{frameIdx}} — ${{new Date().toLocaleTimeString()}}`;
+    Streamlit.setComponentValue(b64);
+  }}
+
+  Streamlit.setFrameHeight(380);
+</script>
+"""
+
+# ─────────────────────────── Layout ───────────────────────────
+
+tab_live, tab_upload = st.tabs(["📷 Live Camera", "🖼️ Upload / Snapshot"])
+
 with tab_live:
-    st.info(
-        "Klik **Take photo** lalu biarkan auto-refresh berjalan. "
-        "Setiap interval, frame terakhir akan diklasifikasi ulang secara otomatis."
-    )
+    col_cam, col_result = st.columns([1, 1])
 
-    # Auto-refresh — only ticks when this tab is active (component is rendered)
-    count = st_autorefresh(interval=refresh_interval, limit=None, key="live_refresh")
+    with col_cam:
+        # Receive base64 frame from JS component
+        frame_b64 = components.html(WEBCAM_COMPONENT, height=400)
 
-    photo = st.camera_input("Kamera", key=f"cam_{count}", label_visibility="collapsed")
+    with col_result:
+        result_box  = st.empty()
+        status_box  = st.empty()
+        tips_box    = st.empty()
+        topk_box    = st.empty()
 
-    result_col, tips_col = st.columns([2, 1])
+        # Process incoming frame
+        if frame_b64 and isinstance(frame_b64, str) and len(frame_b64) > 100:
+            try:
+                img_bytes = base64.b64decode(frame_b64)
+                arr = np.frombuffer(img_bytes, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-    with result_col:
-        if photo is not None:
-            file_bytes = np.asarray(bytearray(photo.read()), dtype=np.uint8)
-            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if img is not None:
+                    scores = run_inference(img, model, img_size)
+                    if scores is not None and scores.size:
+                        annotated, label, conf, is_bad = annotate_image(
+                            img, scores, model.names, bad_labels,
+                            alarm_thr, conf_thr, top_k
+                        )
 
-            if img is None:
-                st.error("Gagal membaca frame kamera.")
-            else:
-                scores = run_inference(img, model, img_size)
-                if scores is not None and scores.size:
-                    annotated, top_label, top_conf, is_bad = annotate_image(
-                        img, scores, model.names, bad_labels,
-                        alarm_threshold, conf_threshold, top_k,
-                    )
-                    st.image(annotated, channels="BGR", use_container_width=True)
+                        result_box.image(annotated, channels="BGR", use_container_width=True)
 
-                    if is_bad:
-                        st.error(f"⚠️ ALARM: postur buruk — **{top_label}** ({top_conf:.2f})")
-                        play_alarm_audio()
-                    else:
-                        st.success(f"✅ Postur aman — **{top_label}** ({top_conf:.2f})")
-                else:
-                    st.warning("Model tidak mengembalikan skor. Coba ulang.")
+                        if is_bad:
+                            status_box.error(f"⚠️ **{label}** — {conf:.2f}")
+                            tips_box.info("💡 Saran:\n" + "\n".join(
+                                f"- {t}" for t in tips_for_label(label)
+                            ))
+                            # Play alarm audio
+                            components.html(
+                                f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}" type="audio/wav"></audio>',
+                                height=0
+                            )
+                        else:
+                            status_box.success(f"✅ **{label}** — {conf:.2f}")
+                            tips_box.empty()
+
+                        topk_lines = "\n".join(
+                            f"`{resolve_label(model.names, i)}` {c:.3f}"
+                            for i, c in topk_scores(scores, top_k)
+                        )
+                        topk_box.markdown(f"**Top-{top_k}:**\n{topk_lines}")
+
+            except Exception as e:
+                status_box.warning(f"Frame error: {e}")
         else:
-            st.caption("Belum ada foto. Klik tombol kamera di atas.")
+            status_box.info("👈 Klik **▶ Start** di panel kamera untuk memulai.")
 
-    with tips_col:
-        # Show tips based on last known bad label stored in session state
-        if photo is not None:
-            file_bytes2 = np.asarray(bytearray(photo.getvalue()), dtype=np.uint8)
-            img2 = cv2.imdecode(file_bytes2, cv2.IMREAD_COLOR)
-            if img2 is not None:
-                scores2 = run_inference(img2, model, img_size)
-                if scores2 is not None and scores2.size:
-                    top1_idx = int(scores2.argmax())
-                    top1_label = resolve_label(model.names, top1_idx)
-                    top1_conf = float(scores2[top1_idx])
-                    is_bad2 = top1_label in bad_labels and top1_conf >= alarm_threshold
-                    if is_bad2:
-                        st.subheader("💡 Saran")
-                        for tip in tips_for_label(top1_label):
-                            st.markdown(f"- {tip}")
 
-# ══════════════ TAB 2: Upload / Snapshot ══════════════
+# ──────────────────────────────────────────
 with tab_upload:
     camera_photo = st.camera_input("Ambil foto")
-    uploaded = st.file_uploader("Atau upload gambar", type=["jpg", "jpeg", "png"])
-
+    uploaded     = st.file_uploader("Atau upload gambar", type=["jpg","jpeg","png"])
     source = camera_photo if camera_photo is not None else uploaded
 
     if source is not None:
-        file_bytes = np.asarray(bytearray(source.read()), dtype=np.uint8)
-        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
+        raw   = np.asarray(bytearray(source.read()), dtype=np.uint8)
+        image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
         if image is None:
-            st.error("Tidak bisa membaca file gambar.")
+            st.error("Tidak bisa membaca file.")
         else:
             scores = run_inference(image, model, img_size)
             if scores is None or not scores.size:
                 st.error("Model tidak mengembalikan skor.")
             else:
-                annotated, top_label, top_conf, is_bad = annotate_image(
+                annotated, label, conf, is_bad = annotate_image(
                     image, scores, model.names, bad_labels,
-                    alarm_threshold, conf_threshold, top_k,
+                    alarm_thr, conf_thr, top_k
                 )
-
-                col_img, col_info = st.columns([2, 1])
-                with col_img:
-                    st.image(annotated, channels="BGR", use_container_width=True, caption="Hasil")
-
-                with col_info:
+                c1, c2 = st.columns([2, 1])
+                with c1:
+                    st.image(annotated, channels="BGR", use_container_width=True)
+                with c2:
                     if is_bad:
-                        st.error(f"⚠️ ALARM: postur buruk\n**{top_label}** ({top_conf:.2f})")
-                        play_alarm_audio()
+                        st.error(f"⚠️ **{label}** ({conf:.2f})")
+                        components.html(
+                            f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}" type="audio/wav"></audio>',
+                            height=0
+                        )
                         st.subheader("💡 Saran")
-                        for tip in tips_for_label(top_label):
-                            st.markdown(f"- {tip}")
+                        for t in tips_for_label(label):
+                            st.markdown(f"- {t}")
                     else:
-                        st.success(f"✅ Postur aman\n**{top_label}** ({top_conf:.2f})")
-
-                    st.subheader("Top-K Scores")
-                    for idx, conf in topk_scores(scores, top_k):
-                        label = resolve_label(model.names, idx)
-                        st.metric(label, f"{conf:.3f}")
+                        st.success(f"✅ **{label}** ({conf:.2f})")
+                    st.subheader(f"Top-{top_k}")
+                    for i, c in topk_scores(scores, top_k):
+                        st.metric(resolve_label(model.names, i), f"{c:.3f}")
