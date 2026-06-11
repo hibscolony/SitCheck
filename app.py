@@ -21,6 +21,11 @@ RTC_CONFIGURATION = RTCConfiguration(
             {"urls": ["stun:stun.l.google.com:19302"]},
             {"urls": ["stun:stun1.l.google.com:19302"]},
             {"urls": ["stun:stun2.l.google.com:19302"]},
+            {
+                "urls": ["turn:free.expressturn.com:3478"],
+                "username": "000000002096550362",
+                "credential": "+wB87Fpja8nfNRg/mSed039T0ao=",
+            },
         ],
         "iceTransportPolicy": "all",
     }
