@@ -181,16 +181,23 @@ for k, v in [("frame_b64", None), ("last_label", ""), ("last_conf", 0.0),
 
 WEBCAM_COMPONENT = f"""
 <style>
-  body {{ margin: 0; background: #0e1117; }}
-  #container {{ display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px; }}
-  video {{ width: 100%; max-width: 480px; border-radius: 8px; border: 2px solid #333; }}
+  html, body {{ margin: 0; background: #0e1117; }}
+  #container {{
+    display: flex; flex-direction: column; align-items: center;
+    gap: 12px; padding: 12px; width: 100%; box-sizing: border-box;
+  }}
+  video {{
+    width: 100%; max-width: 960px; aspect-ratio: 16 / 9;
+    object-fit: cover; border-radius: 12px; border: 2px solid #333;
+    background: #000;
+  }}
   button {{
-    padding: 8px 24px; border-radius: 6px; border: none;
-    cursor: pointer; font-size: 14px; font-weight: 600;
+    padding: 12px 36px; border-radius: 8px; border: none;
+    cursor: pointer; font-size: 16px; font-weight: 600;
   }}
   #btnStart {{ background: #00c853; color: #000; }}
   #btnStop  {{ background: #d32f2f; color: #fff; display: none; }}
-  #status   {{ color: #aaa; font-size: 12px; font-family: monospace; }}
+  #status   {{ color: #aaa; font-size: 13px; font-family: monospace; }}
 </style>
 <div id="container">
   <video id="vid" autoplay playsinline muted></video>
@@ -215,7 +222,10 @@ WEBCAM_COMPONENT = f"""
 
   async function startCam() {{
     try {{
-      stream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: false }});
+      stream = await navigator.mediaDevices.getUserMedia({{
+        video: {{ width: {{ ideal: 1280 }}, height: {{ ideal: 720 }} }},
+        audio: false
+      }});
       vid.srcObject = stream;
       btnStart.style.display = 'none';
       btnStop.style.display  = 'inline-block';
@@ -247,7 +257,7 @@ WEBCAM_COMPONENT = f"""
     Streamlit.setComponentValue(b64);
   }}
 
-  Streamlit.setFrameHeight(380);
+  Streamlit.setFrameHeight(640);
 </script>
 """
 
@@ -256,11 +266,11 @@ WEBCAM_COMPONENT = f"""
 tab_live, tab_upload = st.tabs(["📷 Live Camera", "🖼️ Upload / Snapshot"])
 
 with tab_live:
-    col_cam, col_result = st.columns([1, 1])
+    col_cam, col_result = st.columns([3, 2])
 
     with col_cam:
         # Receive base64 frame from JS component
-        frame_b64 = components.html(WEBCAM_COMPONENT, height=400)
+        frame_b64 = components.html(WEBCAM_COMPONENT, height=640)
 
     with col_result:
         result_box  = st.empty()
@@ -276,6 +286,7 @@ with tab_live:
                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
                 if img is not None:
+                    st.session_state.frame_idx += 1
                     scores = run_inference(img, model, img_size)
                     if scores is not None and scores.size:
                         annotated, label, conf, is_bad = annotate_image(
@@ -290,8 +301,9 @@ with tab_live:
                             tips_box.info("💡 Saran:\n" + "\n".join(
                                 f"- {t}" for t in tips_for_label(label)
                             ))
-                            # Play alarm audio
+                            # Play alarm audio (nonce forces iframe reload -> autoplay each time)
                             components.html(
+                                f'<!-- frame {st.session_state.frame_idx} -->'
                                 f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}" type="audio/wav"></audio>',
                                 height=0
                             )
@@ -333,7 +345,7 @@ with tab_upload:
                 )
                 c1, c2 = st.columns([2, 1])
                 with c1:
-                    st.image(annotated, channels="BGR", use_column_width=True)
+                    st.image(annotated, channels="BGR", use_container_width=True)
                 with c2:
                     if is_bad:
                         st.error(f"⚠️ **{label}** ({conf:.2f})")
