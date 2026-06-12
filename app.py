@@ -150,8 +150,8 @@ def smoothed_is_bad(is_bad_raw: bool) -> bool:
 
 # ─────────────────────────── Page ───────────────────────────
 
-st.set_page_config(page_title="Posture Classifier", layout="wide")
-st.title("🧍 Posture Classifier")
+st.set_page_config(page_title="SitCheck", layout="wide")
+st.title("🪑 SitCheck")
 
 # ── Sidebar ──
 weights = sorted([p.name for p in WEIGHTS_DIR.glob("*.pt")])
