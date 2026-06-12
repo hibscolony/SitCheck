@@ -275,7 +275,7 @@ with tab_upload:
                 )
                 c1, c2 = st.columns([2, 1])
                 with c1:
-                    st.image(annotated, channels="BGR", use_container_width=True)
+                    st.image(annotated, channels="BGR", use_column_width=True)
                 with c2:
                     if is_bad:
                         st.error(f"⚠️ **{label}** ({conf:.2f})")
