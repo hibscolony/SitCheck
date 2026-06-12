@@ -294,7 +294,7 @@ with tab_live:
                             alarm_thr, conf_thr, top_k
                         )
 
-                        result_box.image(annotated, channels="BGR", use_container_width=True)
+                        result_box.image(annotated, channels="BGR", use_column_width=True)
 
                         if is_bad:
                             status_box.error(f"⚠️ **{label}** — {conf:.2f}")
