@@ -189,68 +189,75 @@ with tab_live:
             "lalu jalankan `pip install streamlit-camera-input-live`."
         )
     else:
-        col_cam, col_result = st.columns([3, 2])
 
-        with col_cam:
-            # Returns a fresh BytesIO JPEG every `interval_ms` automatically
-            # (no manual Start/Stop wiring needed, no WebRTC).
-            image_buf = camera_input_live(
-                debounce=interval_ms,
-                height=560,
-                width=860,
-                key="posture_live_cam",
-                show_controls=True,
-            )
+        @st.fragment
+        def live_camera_fragment():
+            col_cam, col_result = st.columns([3, 2])
 
-        with col_result:
-            result_box  = st.empty()
-            status_box  = st.empty()
-            tips_box    = st.empty()
-            topk_box    = st.empty()
+            with col_cam:
+                # Returns a fresh BytesIO JPEG every `interval_ms` automatically
+                # (no manual Start/Stop wiring needed, no WebRTC).
+                # Wrapped in a fragment so only THIS block reruns on each new
+                # frame, instead of the whole page (no more full-page "kedip").
+                image_buf = camera_input_live(
+                    debounce=interval_ms,
+                    height=560,
+                    width=860,
+                    key="posture_live_cam",
+                    show_controls=True,
+                )
 
-            # Process incoming frame
-            if image_buf is not None:
-                try:
-                    img_bytes = image_buf.getvalue()
-                    arr = np.frombuffer(img_bytes, dtype=np.uint8)
-                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            with col_result:
+                result_box  = st.empty()
+                status_box  = st.empty()
+                tips_box    = st.empty()
+                topk_box    = st.empty()
 
-                    if img is not None:
-                        st.session_state.frame_idx += 1
-                        scores = run_inference(img, model, img_size)
-                        if scores is not None and scores.size:
-                            annotated, label, conf, is_bad = annotate_image(
-                                img, scores, model.names, bad_labels,
-                                alarm_thr, conf_thr, top_k
-                            )
+                # Process incoming frame
+                if image_buf is not None:
+                    try:
+                        img_bytes = image_buf.getvalue()
+                        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+                        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-                            result_box.image(annotated, channels="BGR", use_column_width=True)
-
-                            if is_bad:
-                                status_box.error(f"⚠️ **{label}** — {conf:.2f}")
-                                tips_box.info("💡 Saran:\n" + "\n".join(
-                                    f"- {t}" for t in tips_for_label(label)
-                                ))
-                                # Play alarm audio (nonce forces iframe reload -> autoplay each time)
-                                components.html(
-                                    f'<!-- frame {st.session_state.frame_idx} -->'
-                                    f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}" type="audio/wav"></audio>',
-                                    height=0
+                        if img is not None:
+                            st.session_state.frame_idx += 1
+                            scores = run_inference(img, model, img_size)
+                            if scores is not None and scores.size:
+                                annotated, label, conf, is_bad = annotate_image(
+                                    img, scores, model.names, bad_labels,
+                                    alarm_thr, conf_thr, top_k
                                 )
-                            else:
-                                status_box.success(f"✅ **{label}** — {conf:.2f}")
-                                tips_box.empty()
 
-                            topk_lines = "\n".join(
-                                f"`{resolve_label(model.names, i)}` {c:.3f}"
-                                for i, c in topk_scores(scores, top_k)
-                            )
-                            topk_box.markdown(f"**Top-{top_k}:**\n{topk_lines}")
+                                result_box.image(annotated, channels="BGR", use_column_width=True)
 
-                except Exception as e:
-                    status_box.warning(f"Frame error: {e}")
-            else:
-                status_box.info("👈 Klik **Start capturing** di panel kamera untuk memulai.")
+                                if is_bad:
+                                    status_box.error(f"⚠️ **{label}** — {conf:.2f}")
+                                    tips_box.info("💡 Saran:\n" + "\n".join(
+                                        f"- {t}" for t in tips_for_label(label)
+                                    ))
+                                    # Play alarm audio (nonce forces iframe reload -> autoplay each time)
+                                    components.html(
+                                        f'<!-- frame {st.session_state.frame_idx} -->'
+                                        f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}" type="audio/wav"></audio>',
+                                        height=0
+                                    )
+                                else:
+                                    status_box.success(f"✅ **{label}** — {conf:.2f}")
+                                    tips_box.empty()
+
+                                topk_lines = "\n".join(
+                                    f"`{resolve_label(model.names, i)}` {c:.3f}"
+                                    for i, c in topk_scores(scores, top_k)
+                                )
+                                topk_box.markdown(f"**Top-{top_k}:**\n{topk_lines}")
+
+                    except Exception as e:
+                        status_box.warning(f"Frame error: {e}")
+                else:
+                    status_box.info("👈 Klik **Start capturing** di panel kamera untuk memulai.")
+
+        live_camera_fragment()
 
 
 # ──────────────────────────────────────────
