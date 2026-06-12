@@ -1,5 +1,6 @@
 streamlit==1.39.0
 streamlit-autorefresh
+streamlit-camera-input-live
 streamlit-webrtc==0.47.9
 opencv-python-headless==4.10.0.84
 # av==12.3.0
