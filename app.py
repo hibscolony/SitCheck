@@ -215,16 +215,13 @@ with tab_live:
 
         @st.fragment
         def live_camera_fragment():
-            col_cam, col_result = st.columns([3, 2])
-
-            with col_cam:
-                image_buf = camera_input_live(
-                    debounce=interval_ms,
-                    height=560,
-                    width=860,
-                    key="posture_live_cam",
-                    show_controls=True,
-                )
+            # ── Baris 1: kamera full-width ──
+            image_buf = camera_input_live(
+                debounce=interval_ms,
+                height=480,
+                key="posture_live_cam",
+                show_controls=True,
+            )
 
             # ── Proses frame baru (hanya jika ada input) ──
             if image_buf is not None:
@@ -245,14 +242,12 @@ with tab_live:
                             )
                             is_bad = smoothed_is_bad(is_bad_raw)
 
-                            # Simpan hasil ke session_state sebagai DATA
                             st.session_state.last_annotated = annotated
                             st.session_state.last_label     = label
                             st.session_state.last_conf      = conf
                             st.session_state.last_is_bad    = is_bad
                             st.session_state.last_topk      = topk_scores(scores, top_k)
 
-                            # Alarm cooldown
                             alarm_cooldown = max(3, smooth_win)
                             if is_bad and fidx - st.session_state.last_alarm >= alarm_cooldown:
                                 st.session_state.last_alarm = fidx
@@ -263,17 +258,20 @@ with tab_live:
                 except Exception as e:
                     st.session_state.last_label = f"error: {e}"
 
-            # ── Render hasil dari session_state (tidak pernah crash) ──
-            with col_result:
-                if st.session_state.last_annotated is not None:
-                    st.image(st.session_state.last_annotated,
-                             channels="BGR", use_column_width=True)
+            # ── Baris 2: hasil annotasi full-width ──
+            if st.session_state.last_annotated is not None:
+                st.image(st.session_state.last_annotated,
+                         channels="BGR", use_container_width=True)
 
+                # ── Baris 3: status | saran | top-k dalam 3 kolom ──
+                col_status, col_tips, col_topk = st.columns([1, 2, 1])
+
+                with col_status:
                     if st.session_state.last_is_bad:
-                        st.error(f"⚠️ **{st.session_state.last_label}** — {st.session_state.last_conf:.2f}")
-                        st.info("💡 Saran:\n" + "\n".join(
-                            f"- {t}" for t in tips_for_label(st.session_state.last_label)
-                        ))
+                        st.error(
+                            f"⚠️ **Postur Buruk**\n\n"
+                            f"`{st.session_state.last_label}` — {st.session_state.last_conf:.2f}"
+                        )
                         if st.session_state.play_alarm:
                             fidx = st.session_state.frame_idx
                             components.html(
@@ -284,17 +282,27 @@ with tab_live:
                                 height=0,
                             )
                     else:
-                        st.success(f"✅ **{st.session_state.last_label}** — {st.session_state.last_conf:.2f}")
-
-                    if st.session_state.last_topk:
-                        topk_lines = "\n".join(
-                            f"`{resolve_label(model.names, i)}` {c:.3f}"
-                            for i, c in st.session_state.last_topk
+                        st.success(
+                            f"✅ **Postur Baik**\n\n"
+                            f"`{st.session_state.last_label}` — {st.session_state.last_conf:.2f}"
                         )
-                        st.markdown(f"**Top-{top_k}:**\n{topk_lines}")
 
-                elif image_buf is None:
-                    st.info("👈 Klik **Start capturing** di panel kamera untuk memulai.")
+                with col_tips:
+                    if st.session_state.last_is_bad:
+                        tips = tips_for_label(st.session_state.last_label)
+                        st.info("💡 **Saran:**\n" + "\n".join(f"- {t}" for t in tips))
+                    else:
+                        st.info("💡 **Pertahankan postur yang baik!**\n- Tetap rileks dan tegak.\n- Istirahat setiap 30 menit.")
+
+                with col_topk:
+                    if st.session_state.last_topk:
+                        st.markdown(f"**Top-{top_k} Skor:**")
+                        for i, c in st.session_state.last_topk:
+                            lbl = resolve_label(model.names, i)
+                            st.metric(label=lbl, value=f"{c:.3f}")
+
+            elif image_buf is None:
+                st.info("👈 Klik **Start capturing** di panel kamera untuk memulai.")
 
         live_camera_fragment()
 
