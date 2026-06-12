@@ -242,7 +242,10 @@ with tab_live:
                             )
                             is_bad = smoothed_is_bad(is_bad_raw)
 
-                            st.session_state.last_annotated = annotated
+                            # Encode ke JPEG bytes — lebih aman di session_state
+                            # daripada raw numpy array (hindari serialization error)
+                            ok, buf_enc = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                            st.session_state.last_annotated = buf_enc.tobytes() if ok else None
                             st.session_state.last_label     = label
                             st.session_state.last_conf      = conf
                             st.session_state.last_is_bad    = is_bad
@@ -261,7 +264,7 @@ with tab_live:
             # ── Baris 2: hasil annotasi full-width ──
             if st.session_state.last_annotated is not None:
                 st.image(st.session_state.last_annotated,
-                         channels="BGR", use_container_width=True)
+                         use_container_width=True)
 
                 # ── Baris 3: status | saran | top-k dalam 3 kolom ──
                 col_status, col_tips, col_topk = st.columns([1, 2, 1])
