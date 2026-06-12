@@ -1,24 +1,17 @@
 """
 app.py — Posture Classifier (True Real-Time, No WebRTC)
-Mechanism:
-  - Custom HTML component captures webcam frames via getUserMedia + Canvas
-  - Every N ms, JS encodes frame as base64 JPEG and writes to a temp file
-    via a small /upload_frame endpoint served by a background thread (Flask)
-  - Streamlit main loop reads the temp file and runs YOLO inference
-  - Results rendered in Streamlit UI
-
-Actually simpler approach that truly works on Streamlit Cloud:
-  - st.components.v1.html captures webcam as base64
-  - Uses st.components bidirectional communication (component_value)
-  - Each new frame triggers inference + UI update via session_state
+Fix:
+  1. Tidak kedip: semua st.empty() di-persist via session_state agar tidak
+     dibuat ulang setiap frame; alarm audio dimasukkan ke dalam container.
+  2. Info stabil: prediction smoothing via rolling window (majority vote)
+     sebelum label dianggap bad — mencegah flip-flop satu frame.
 """
 from __future__ import annotations
 
 import base64
 import io
-import threading
-import time
 import wave
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -52,6 +45,9 @@ TIP_RULES = {
     "lean": ("Pusatkan berat badan dan duduk seimbang.", "Letakkan telapak kaki rata di lantai."),
     "tilt": ("Sejajarkan bahu dan jaga kepala tetap di tengah.", "Hindari miring terlalu lama ke satu sisi."),
 }
+
+# Jumlah frame untuk smoothing (3 frame = butuh 2/3 majority utk trigger bad)
+SMOOTH_WINDOW = 3
 
 # ─────────────────────────── Helpers ───────────────────────────
 
@@ -143,6 +139,16 @@ def annotate_image(img, scores, names, bad_labels, alarm_thr, conf_thr, top_k):
     return out, label, conf, is_bad
 
 
+def smoothed_is_bad(is_bad_raw: bool) -> bool:
+    """
+    Tambahkan hasil raw ke rolling window, kembalikan True hanya jika
+    mayoritas (>50%) frame dalam window = bad. Mencegah flip-flop 1 frame.
+    """
+    buf: deque = st.session_state.bad_history
+    buf.append(is_bad_raw)
+    return sum(buf) > len(buf) / 2
+
+
 # ─────────────────────────── Page ───────────────────────────
 
 st.set_page_config(page_title="Posture Classifier", layout="wide")
@@ -153,29 +159,40 @@ weights = sorted([p.name for p in WEIGHTS_DIR.glob("*.pt")])
 if not weights:
     st.error(f"No .pt weights in {WEIGHTS_DIR}"); st.stop()
 
-sel_w = st.sidebar.selectbox("Model weights", weights,
-    index=weights.index("best.pt") if "best.pt" in weights else 0)
+sel_w       = st.sidebar.selectbox("Model weights", weights,
+                index=weights.index("best.pt") if "best.pt" in weights else 0)
 img_size    = st.sidebar.select_slider("Image size",
-    options=[160,192,224,256,288,320], value=DEFAULT_IMG_SIZE)
+                options=[160, 192, 224, 256, 288, 320], value=DEFAULT_IMG_SIZE)
 conf_thr    = st.sidebar.slider("Display threshold", 0.0, 1.0, 0.5, 0.01)
 top_k       = st.sidebar.slider("Top-K", 1, 5, 2)
 alarm_thr   = st.sidebar.slider("Alarm threshold", 0.0, 1.0, DEFAULT_ALARM_THRESHOLD, 0.01)
 interval_ms = st.sidebar.select_slider("Capture interval",
-    options=[500, 750, 1000, 1500, 2000], value=1000,
-    format_func=lambda x: f"{x} ms")
+                options=[500, 750, 1000, 1500, 2000], value=1000,
+                format_func=lambda x: f"{x} ms")
+smooth_win  = st.sidebar.slider("Smoothing window", 1, 7, SMOOTH_WINDOW,
+                help="Jumlah frame untuk majority-vote sebelum bad posture dikonfirmasi.")
 
-model = load_model(str(WEIGHTS_DIR / sel_w))
-labels = list_labels(model.names)
+model      = load_model(str(WEIGHTS_DIR / sel_w))
+labels     = list_labels(model.names)
 bad_labels: set[str] = set(infer_bad_labels(labels))
 st.sidebar.caption("Bad labels: " + (", ".join(sorted(bad_labels)) or "none detected"))
 
 alarm_b64 = alarm_audio_b64()
 
 # ─────────────────────────── Session state ───────────────────────────
-for k, v in [("frame_b64", None), ("last_label", ""), ("last_conf", 0.0),
-             ("last_is_bad", False), ("running", False), ("frame_idx", 0)]:
+_ss_defaults = {
+    "frame_idx":   0,
+    "last_alarm":  -999,       # frame_idx saat alarm terakhir dibunyikan
+    "bad_history": deque(maxlen=smooth_win),
+}
+for k, v in _ss_defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# Sync maxlen jika slider berubah (deque baru dengan isi lama dipotong)
+if st.session_state.bad_history.maxlen != smooth_win:
+    old = list(st.session_state.bad_history)
+    st.session_state.bad_history = deque(old[-smooth_win:], maxlen=smooth_win)
 
 # ─────────────────────────── Layout ───────────────────────────
 
@@ -195,10 +212,6 @@ with tab_live:
             col_cam, col_result = st.columns([3, 2])
 
             with col_cam:
-                # Returns a fresh BytesIO JPEG every `interval_ms` automatically
-                # (no manual Start/Stop wiring needed, no WebRTC).
-                # Wrapped in a fragment so only THIS block reruns on each new
-                # frame, instead of the whole page (no more full-page "kedip").
                 image_buf = camera_input_live(
                     debounce=interval_ms,
                     height=560,
@@ -208,12 +221,18 @@ with tab_live:
                 )
 
             with col_result:
-                result_box  = st.empty()
-                status_box  = st.empty()
-                tips_box    = st.empty()
-                topk_box    = st.empty()
+                # ── FIX 1: Buat container SEKALI, simpan di session_state ──
+                # Kalau dibuat ulang tiap frame → UI kedip.
+                if "live_containers" not in st.session_state:
+                    st.session_state.live_containers = {
+                        "result":  st.empty(),
+                        "status":  st.empty(),
+                        "tips":    st.empty(),
+                        "topk":    st.empty(),
+                        "audio":   st.empty(),   # ← audio masuk sini, bukan lepas
+                    }
+                C = st.session_state.live_containers
 
-                # Process incoming frame
                 if image_buf is not None:
                     try:
                         img_bytes = image_buf.getvalue()
@@ -222,40 +241,56 @@ with tab_live:
 
                         if img is not None:
                             st.session_state.frame_idx += 1
+                            fidx = st.session_state.frame_idx
+
                             scores = run_inference(img, model, img_size)
                             if scores is not None and scores.size:
-                                annotated, label, conf, is_bad = annotate_image(
+                                annotated, label, conf, is_bad_raw = annotate_image(
                                     img, scores, model.names, bad_labels,
                                     alarm_thr, conf_thr, top_k
                                 )
 
-                                result_box.image(annotated, channels="BGR", use_column_width=True)
+                                # ── FIX 2: Smoothing majority-vote ──
+                                is_bad = smoothed_is_bad(is_bad_raw)
+
+                                C["result"].image(annotated, channels="BGR",
+                                                  use_column_width=True)
 
                                 if is_bad:
-                                    status_box.error(f"⚠️ **{label}** — {conf:.2f}")
-                                    tips_box.info("💡 Saran:\n" + "\n".join(
+                                    C["status"].error(f"⚠️ **{label}** — {conf:.2f}")
+                                    C["tips"].info("💡 Saran:\n" + "\n".join(
                                         f"- {t}" for t in tips_for_label(label)
                                     ))
-                                    # Play alarm audio (nonce forces iframe reload -> autoplay each time)
-                                    components.html(
-                                        f'<!-- frame {st.session_state.frame_idx} -->'
-                                        f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}" type="audio/wav"></audio>',
-                                        height=0
-                                    )
+                                    # ── FIX 3: Audio di dalam container; bunyikan
+                                    #    hanya jika frame terakhir alarm sudah lewat
+                                    #    (hindari spam audio tiap frame) ──
+                                    alarm_cooldown = max(3, smooth_win)
+                                    if fidx - st.session_state.last_alarm >= alarm_cooldown:
+                                        st.session_state.last_alarm = fidx
+                                        C["audio"].html(
+                                            f'<!-- nonce:{fidx} -->'
+                                            f'<audio autoplay>'
+                                            f'<source src="data:audio/wav;base64,{alarm_b64}"'
+                                            f' type="audio/wav"></audio>',
+                                            height=0,
+                                        )
+                                    else:
+                                        C["audio"].empty()
                                 else:
-                                    status_box.success(f"✅ **{label}** — {conf:.2f}")
-                                    tips_box.empty()
+                                    C["status"].success(f"✅ **{label}** — {conf:.2f}")
+                                    C["tips"].empty()
+                                    C["audio"].empty()
 
                                 topk_lines = "\n".join(
                                     f"`{resolve_label(model.names, i)}` {c:.3f}"
                                     for i, c in topk_scores(scores, top_k)
                                 )
-                                topk_box.markdown(f"**Top-{top_k}:**\n{topk_lines}")
+                                C["topk"].markdown(f"**Top-{top_k}:**\n{topk_lines}")
 
                     except Exception as e:
-                        status_box.warning(f"Frame error: {e}")
+                        C["status"].warning(f"Frame error: {e}")
                 else:
-                    status_box.info("👈 Klik **Start capturing** di panel kamera untuk memulai.")
+                    C["status"].info("👈 Klik **Start capturing** di panel kamera untuk memulai.")
 
         live_camera_fragment()
 
@@ -263,7 +298,7 @@ with tab_live:
 # ──────────────────────────────────────────
 with tab_upload:
     camera_photo = st.camera_input("Ambil foto")
-    uploaded     = st.file_uploader("Atau upload gambar", type=["jpg","jpeg","png"])
+    uploaded     = st.file_uploader("Atau upload gambar", type=["jpg", "jpeg", "png"])
     source = camera_photo if camera_photo is not None else uploaded
 
     if source is not None:
@@ -287,7 +322,8 @@ with tab_upload:
                     if is_bad:
                         st.error(f"⚠️ **{label}** ({conf:.2f})")
                         components.html(
-                            f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}" type="audio/wav"></audio>',
+                            f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}"'
+                            f' type="audio/wav"></audio>',
                             height=0
                         )
                         st.subheader("💡 Saran")
