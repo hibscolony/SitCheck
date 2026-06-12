@@ -264,7 +264,7 @@ with tab_live:
             # ── Baris 2: hasil annotasi full-width ──
             if st.session_state.last_annotated is not None:
                 st.image(st.session_state.last_annotated,
-                         use_container_width=True)
+                         use_column_width=True)
 
                 # ── Baris 3: status | saran | top-k dalam 3 kolom ──
                 col_status, col_tips, col_topk = st.columns([1, 2, 1])
