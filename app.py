@@ -27,6 +27,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 from ultralytics import YOLO
 
+try:
+    from camera_input_live import camera_input_live
+except ImportError:
+    camera_input_live = None
+
 # ─────────────────────────── Constants ───────────────────────────
 
 WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
@@ -172,155 +177,80 @@ for k, v in [("frame_b64", None), ("last_label", ""), ("last_conf", 0.0),
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ─────────────────────────── Webcam HTML Component ───────────────────────────
-# This component:
-#   1. Opens webcam via getUserMedia
-#   2. Every `interval_ms` ms, draws video to canvas and encodes as base64 JPEG
-#   3. Sends base64 string to Streamlit via Streamlit.setComponentValue
-#   4. Streamlit receives it, runs inference, updates UI
-
-WEBCAM_COMPONENT = f"""
-<style>
-  html, body {{ margin: 0; background: #0e1117; }}
-  #container {{
-    display: flex; flex-direction: column; align-items: center;
-    gap: 12px; padding: 12px; width: 100%; box-sizing: border-box;
-  }}
-  video {{
-    width: 100%; max-width: 960px; aspect-ratio: 16 / 9;
-    object-fit: cover; border-radius: 12px; border: 2px solid #333;
-    background: #000;
-  }}
-  button {{
-    padding: 12px 36px; border-radius: 8px; border: none;
-    cursor: pointer; font-size: 16px; font-weight: 600;
-  }}
-  #btnStart {{ background: #00c853; color: #000; }}
-  #btnStop  {{ background: #d32f2f; color: #fff; display: none; }}
-  #status   {{ color: #aaa; font-size: 13px; font-family: monospace; }}
-</style>
-<div id="container">
-  <video id="vid" autoplay playsinline muted></video>
-  <div style="display:flex;gap:8px;">
-    <button id="btnStart" onclick="startCam()">▶ Start</button>
-    <button id="btnStop"  onclick="stopCam()">⏹ Stop</button>
-  </div>
-  <div id="status">Kamera belum aktif</div>
-</div>
-<canvas id="canvas" style="display:none"></canvas>
-
-<script>
-  const vid      = document.getElementById('vid');
-  const canvas   = document.getElementById('canvas');
-  const ctx      = canvas.getContext('2d');
-  const status   = document.getElementById('status');
-  const btnStart = document.getElementById('btnStart');
-  const btnStop  = document.getElementById('btnStop');
-  let stream = null;
-  let timer  = null;
-  let frameIdx = 0;
-
-  async function startCam() {{
-    try {{
-      stream = await navigator.mediaDevices.getUserMedia({{
-        video: {{ width: {{ ideal: 1280 }}, height: {{ ideal: 720 }} }},
-        audio: false
-      }});
-      vid.srcObject = stream;
-      btnStart.style.display = 'none';
-      btnStop.style.display  = 'inline-block';
-      status.textContent = 'Kamera aktif — mengirim frame...';
-      timer = setInterval(captureFrame, {interval_ms});
-    }} catch(e) {{
-      status.textContent = 'ERROR: ' + e.message;
-    }}
-  }}
-
-  function stopCam() {{
-    clearInterval(timer);
-    if (stream) stream.getTracks().forEach(t => t.stop());
-    vid.srcObject = null;
-    btnStart.style.display = 'inline-block';
-    btnStop.style.display  = 'none';
-    status.textContent = 'Kamera dihentikan';
-    Streamlit.setComponentValue(null);
-  }}
-
-  function captureFrame() {{
-    if (!vid.videoWidth) return;
-    canvas.width  = vid.videoWidth;
-    canvas.height = vid.videoHeight;
-    ctx.drawImage(vid, 0, 0);
-    const b64 = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
-    frameIdx++;
-    status.textContent = `Frame #${{frameIdx}} — ${{new Date().toLocaleTimeString()}}`;
-    Streamlit.setComponentValue(b64);
-  }}
-
-  Streamlit.setFrameHeight(640);
-</script>
-"""
-
 # ─────────────────────────── Layout ───────────────────────────
 
 tab_live, tab_upload = st.tabs(["📷 Live Camera", "🖼️ Upload / Snapshot"])
 
 with tab_live:
-    col_cam, col_result = st.columns([3, 2])
+    if camera_input_live is None:
+        st.error(
+            "Paket **streamlit-camera-input-live** belum terpasang.\n\n"
+            "Tambahkan `streamlit-camera-input-live` ke `requirements.txt` "
+            "lalu jalankan `pip install streamlit-camera-input-live`."
+        )
+    else:
+        col_cam, col_result = st.columns([3, 2])
 
-    with col_cam:
-        # Receive base64 frame from JS component
-        frame_b64 = components.html(WEBCAM_COMPONENT, height=640)
+        with col_cam:
+            # Returns a fresh BytesIO JPEG every `interval_ms` automatically
+            # (no manual Start/Stop wiring needed, no WebRTC).
+            image_buf = camera_input_live(
+                debounce=interval_ms,
+                height=560,
+                width=860,
+                key="posture_live_cam",
+                show_controls=True,
+            )
 
-    with col_result:
-        result_box  = st.empty()
-        status_box  = st.empty()
-        tips_box    = st.empty()
-        topk_box    = st.empty()
+        with col_result:
+            result_box  = st.empty()
+            status_box  = st.empty()
+            tips_box    = st.empty()
+            topk_box    = st.empty()
 
-        # Process incoming frame
-        if frame_b64 and isinstance(frame_b64, str) and len(frame_b64) > 100:
-            try:
-                img_bytes = base64.b64decode(frame_b64)
-                arr = np.frombuffer(img_bytes, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            # Process incoming frame
+            if image_buf is not None:
+                try:
+                    img_bytes = image_buf.getvalue()
+                    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-                if img is not None:
-                    st.session_state.frame_idx += 1
-                    scores = run_inference(img, model, img_size)
-                    if scores is not None and scores.size:
-                        annotated, label, conf, is_bad = annotate_image(
-                            img, scores, model.names, bad_labels,
-                            alarm_thr, conf_thr, top_k
-                        )
-
-                        result_box.image(annotated, channels="BGR", use_column_width=True)
-
-                        if is_bad:
-                            status_box.error(f"⚠️ **{label}** — {conf:.2f}")
-                            tips_box.info("💡 Saran:\n" + "\n".join(
-                                f"- {t}" for t in tips_for_label(label)
-                            ))
-                            # Play alarm audio (nonce forces iframe reload -> autoplay each time)
-                            components.html(
-                                f'<!-- frame {st.session_state.frame_idx} -->'
-                                f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}" type="audio/wav"></audio>',
-                                height=0
+                    if img is not None:
+                        st.session_state.frame_idx += 1
+                        scores = run_inference(img, model, img_size)
+                        if scores is not None and scores.size:
+                            annotated, label, conf, is_bad = annotate_image(
+                                img, scores, model.names, bad_labels,
+                                alarm_thr, conf_thr, top_k
                             )
-                        else:
-                            status_box.success(f"✅ **{label}** — {conf:.2f}")
-                            tips_box.empty()
 
-                        topk_lines = "\n".join(
-                            f"`{resolve_label(model.names, i)}` {c:.3f}"
-                            for i, c in topk_scores(scores, top_k)
-                        )
-                        topk_box.markdown(f"**Top-{top_k}:**\n{topk_lines}")
+                            result_box.image(annotated, channels="BGR", use_container_width=True)
 
-            except Exception as e:
-                status_box.warning(f"Frame error: {e}")
-        else:
-            status_box.info("👈 Klik **▶ Start** di panel kamera untuk memulai.")
+                            if is_bad:
+                                status_box.error(f"⚠️ **{label}** — {conf:.2f}")
+                                tips_box.info("💡 Saran:\n" + "\n".join(
+                                    f"- {t}" for t in tips_for_label(label)
+                                ))
+                                # Play alarm audio (nonce forces iframe reload -> autoplay each time)
+                                components.html(
+                                    f'<!-- frame {st.session_state.frame_idx} -->'
+                                    f'<audio autoplay><source src="data:audio/wav;base64,{alarm_b64}" type="audio/wav"></audio>',
+                                    height=0
+                                )
+                            else:
+                                status_box.success(f"✅ **{label}** — {conf:.2f}")
+                                tips_box.empty()
+
+                            topk_lines = "\n".join(
+                                f"`{resolve_label(model.names, i)}` {c:.3f}"
+                                for i, c in topk_scores(scores, top_k)
+                            )
+                            topk_box.markdown(f"**Top-{top_k}:**\n{topk_lines}")
+
+                except Exception as e:
+                    status_box.warning(f"Frame error: {e}")
+            else:
+                status_box.info("👈 Klik **Start capturing** di panel kamera untuk memulai.")
 
 
 # ──────────────────────────────────────────
